@@ -1014,6 +1014,15 @@ class MultiMarketStateStore:
         self.save()
         return reason
 
+    def get_pending_exit_reason(self, market: str) -> str:
+        """
+        pending_exit_reason을 읽기만 하고 지우지 않습니다.
+        단순 조회 목적에는 pop 대신 이 메서드를 사용하세요.
+        pop은 포지션이 실제로 종료됐을 때만 사용합니다.
+        """
+        self._ensure_market(market)
+        return str(self.state["markets"][market].get("pending_exit_reason", "") or "")
+
     def get_prev_base_total(self, market: str) -> float:
         self._ensure_market(market)
         return float(self.state["markets"][market].get("prev_base_total", 0.0) or 0.0)
@@ -1099,6 +1108,16 @@ class MultiMarketStateStore:
         self._ensure_market(market)
         self.state["markets"][market]["partial_exited"] = True
         self.save()
+
+    def clear_partial_exited(self, market: str) -> None:
+        """
+        부분 익절 주문이 취소된 경우 partial_exited를 False로 초기화합니다.
+        미체결 주문 취소 후 다음 조건 충족 시 재시도를 허용합니다.
+        """
+        self._ensure_market(market)
+        if self.state["markets"][market].get("partial_exited"):
+            self.state["markets"][market]["partial_exited"] = False
+            self.save()
 
     # ── 브레이크이븐 스탑 활성화 추적 ─────────────────────────────────────────
     def is_breakeven_activated(self, market: str) -> bool:
@@ -1873,26 +1892,45 @@ def precheck_sell_order(client: UpbitClient, chance_cache: ChanceCache, market: 
 def classify_exit_reason(sell_reason: str) -> str:
     """
     매도 사유를 내부 분류 코드로 변환합니다.
-    손실성/방어성 청산은 모두 stop_loss로 분류해 서킷브레이커 카운터에 포함시킵니다.
+
+    우선순위:
+    1. 내부 상태 코드 문자열(stop_loss, partial_exit 등)은 그대로 반환
+    2. "부분익절"은 "익절"보다 반드시 먼저 체크 ("부분익절" 안에 "익절" 포함)
+    3. 손실성/방어성 청산은 모두 stop_loss로 분류해 서킷브레이커 카운터에 포함
     """
-    stop_loss_keywords = [
+    reason = str(sell_reason or "")
+
+    # ── 내부 상태 코드 직접 인식 (set_pending_exit_reason에서 저장한 값) ──────
+    _INTERNAL_CODES = {
+        "stop_loss", "take_profit", "partial_exit",
+        "htf_trend_exit", "trend_exit", "sell",
+    }
+    if reason in _INTERNAL_CODES:
+        return reason
+
+    # ── "부분익절"은 반드시 "익절"보다 먼저 체크 ─────────────────────────────
+    if "부분익절" in reason:
+        return "partial_exit"
+
+    # ── 손실성/방어성 청산 → stop_loss ───────────────────────────────────────
+    _STOP_KEYWORDS = [
         "손절",
-        "방어 청산",    # 추세 이탈 방어청산 (손실권)
-        "브레이크이븐", # 원금 보호선 이탈
+        "방어 청산",
+        "브레이크이븐",
         "트레일링 스탑",
         "타임 스탑",
         "샹들리에",
     ]
-    if any(k in sell_reason for k in stop_loss_keywords):
+    if any(k in reason for k in _STOP_KEYWORDS):
         return "stop_loss"
-    if "익절" in sell_reason:
+
+    if "익절" in reason:
         return "take_profit"
-    if "부분익절" in sell_reason:
-        return "partial_exit"
-    if "상위 추세 이탈" in sell_reason:
+    if "상위 추세 이탈" in reason:
         return "htf_trend_exit"
-    if "추세 이탈" in sell_reason:
+    if "추세 이탈" in reason:
         return "trend_exit"
+
     return "sell"
 
 
@@ -2901,6 +2939,7 @@ def main():
                     and strat.get("trend_up", False)        # 현재 추세 필수
                     and strat.get("pullback_ok", False)     # 눌림목 필수
                     and strat.get("volume_ok", False)       # 거래대금 필수
+                    and strat.get("spread_ok", False)       # 스프레드 필수 (넓은 구간 진입 차단)
                     and rsi_in_range                        # RSI 범위 필수
                     and not obi_blocks_entry
                     and snap["position_krw"] < cfg.min_order_krw
@@ -3115,36 +3154,46 @@ def main():
                             "stop_loss", "htf_trend_exit", "trend_exit"
                         )
                         # 기존 주문의 사유가 partial_exit이면 부분익절 주문
-                        existing_reason = state_store.pop_pending_exit_reason(market) or "sell"
+                        # get(조회만) 사용 — 취소 성공 시에만 실제 소비(pop/override)
+                        existing_reason = state_store.get_pending_exit_reason(market) or "sell"
                         existing_is_partial = classify_exit_reason(existing_reason) == "partial_exit"
 
                         if is_full_exit and existing_is_partial:
-                            # 부분 익절 주문 먼저 취소
                             logging.info(
                                 "전량 청산 신호 — 부분익절 주문 취소 후 전량 매도 | market=%s | 청산사유=%s",
                                 market, a["sell_reason"][:50],
                             )
-                            cancel_orders_for_market(
+                            canceled = cancel_orders_for_market(
                                 client, cfg, journal, a["sell_orders"],
                                 f"전량 청산 우선 (부분익절 주문 대체): {a['sell_reason'][:30]}"
                             )
                             if cfg.order_mode == "live":
                                 a["open_orders"] = client.get_all_open_orders(states=["wait", "watch"], market=market)
                                 a["sell_orders"] = [o for o in a["open_orders"] if o.get("side") == "ask" and is_bot_order(o, cfg.bot_id_prefix)]
-                            # sell_volume을 전량(base_total)으로 재계산
-                            full_volume = a["snap"]["base_total"]
-                            if full_volume > 0:
-                                state_store.set_pending_exit_reason(market, a["sell_reason"])
-                                sell_price = a["best_bid"]  # 긴급 전량 청산 → taker
-                                place_or_reprice_limit_sell(
-                                    client, cfg, journal, market, a["open_orders"],
-                                    sell_price, full_volume
-                                )
+
+                            if canceled:
+                                # 취소 성공 시에만 상태 교체
                                 account_cache.invalidate()
-                                continue  # 아래 일반 매도 관리 스킵
-                        else:
-                            # 복원
-                            state_store.set_pending_exit_reason(market, existing_reason)
+                                # 취소 후 최신 잔고로 실제 가용 수량 재계산 (지적 5 수정)
+                                if cfg.order_mode == "live":
+                                    fresh_accounts = client.get_accounts()
+                                    fresh_snap = get_position_snapshot(fresh_accounts, market, a["current_price"])
+                                    full_volume = fresh_snap["base_balance"]
+                                else:
+                                    full_volume = a["snap"]["base_total"]
+
+                                if full_volume > 0:
+                                    state_store.set_pending_exit_reason(market, a["sell_reason"])
+                                    # partial_exited 초기화 (취소됐으므로)
+                                    state_store.clear_partial_exited(market)
+                                    sell_price = a["best_bid"]
+                                    place_or_reprice_limit_sell(
+                                        client, cfg, journal, market, a["open_orders"],
+                                        sell_price, full_volume
+                                    )
+                                    account_cache.invalidate()
+                                    continue
+                            # 취소 실패 시 — 기존 pending_exit_reason 유지 (get이라 지워지지 않음)
 
                     manage_sell = a["sell_ok"] or bool(a["sell_orders"])
 
@@ -3153,7 +3202,8 @@ def main():
                     # - 익절/부분익절 주문 → 조건 소멸이므로 취소
                     # - 손절/방어청산 계열 → 조건 여부 무관하게 유지
                     if a["sell_orders"] and not a["sell_ok"] and manage_sell:
-                        existing_reason = state_store.pop_pending_exit_reason(market) or "sell"
+                        # get(조회만) 사용 — 취소 성공 시에만 실제 소비
+                        existing_reason = state_store.get_pending_exit_reason(market) or "sell"
                         existing_class = classify_exit_reason(existing_reason)
                         is_take_profit_order = existing_class in ("take_profit", "partial_exit")
 
@@ -3166,13 +3216,18 @@ def main():
                                 client, cfg, journal, a["sell_orders"],
                                 f"익절 조건 소멸, 하락 추격 방지 (원래 사유: {existing_reason[:30]})"
                             )
-                            if canceled and cfg.order_mode == "live":
-                                a["open_orders"] = client.get_all_open_orders(states=["wait", "watch"], market=market)
-                                a["sell_orders"] = [o for o in a["open_orders"] if o.get("side") == "ask" and is_bot_order(o, cfg.bot_id_prefix)]
-                            account_cache.invalidate()
-                            continue
-                        else:
-                            state_store.set_pending_exit_reason(market, existing_reason)
+                            if canceled:
+                                # 취소 성공 시에만 상태 소비
+                                state_store.set_pending_exit_reason(market, "")
+                                # 부분익절 주문이 취소됐으면 partial_exited 초기화 (재시도 허용)
+                                if existing_class == "partial_exit":
+                                    state_store.clear_partial_exited(market)
+                                if cfg.order_mode == "live":
+                                    a["open_orders"] = client.get_all_open_orders(states=["wait", "watch"], market=market)
+                                    a["sell_orders"] = [o for o in a["open_orders"] if o.get("side") == "ask" and is_bot_order(o, cfg.bot_id_prefix)]
+                                account_cache.invalidate()
+                                continue
+                            # 취소 실패 시 — pending_exit_reason 그대로 유지 (get이라 지워지지 않음)
                     if manage_sell:
                         if a["buy_orders"]:
                             # ── 매도 우선 시 매수 주문 취소 ────────────────────
@@ -3216,8 +3271,9 @@ def main():
 
                         if precheck_ok and sell_volume > 0:
                             # 매도 사유를 항상 저장 (조건 소멸 시 취소 판단에 사용)
+                            # get(조회만) 사용 — 기존 사유를 소비하지 않고 참조
                             exit_class = classify_exit_reason(a["sell_reason"]) if a["sell_ok"] else (
-                                state_store.pop_pending_exit_reason(market) or "sell"
+                                state_store.get_pending_exit_reason(market) or "sell"
                             )
                             state_store.set_pending_exit_reason(market, a["sell_reason"] if a["sell_ok"] else exit_class)
 
