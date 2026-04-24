@@ -52,6 +52,7 @@ try:
         calc_buy_volume,
         calc_dynamic_buy_amount,
         check_partial_exit,
+        classify_exit_reason,
         required_candle_count,
         extract_candles_asc,
     )
@@ -97,12 +98,34 @@ def _call_should_sell(
 
     result = should_sell(**kwargs)
 
-    # 반환값이 3개(최신 버전)이면 그대로, 2개(구버전)이면 be_activated=False 보완
     if isinstance(result, tuple) and len(result) == 3:
         return result[0], result[1], result[2]
     elif isinstance(result, tuple) and len(result) == 2:
         return result[0], result[1], breakeven_activated
     return bool(result), "", breakeven_activated
+
+
+def should_buy_backtest(cfg: Config, strat: dict, score: float) -> bool:
+    """
+    라이브 buy_ok와 동일한 하드 필터 조건.
+    백테스터와 라이브가 동일한 진입 로직을 공유합니다.
+    """
+    if score <= 0:
+        return False
+    min_score = getattr(cfg, "min_entry_score", 0.0)
+    if min_score > 0 and score < min_score:
+        return False
+    rsi_in_range = (
+        cfg.rsi_buy_min <= strat.get("rsi", 0) <= cfg.rsi_buy_max
+    )
+    return (
+        strat.get("htf_trend_up", False)
+        and strat.get("trend_up", False)
+        and strat.get("pullback_ok", False)
+        and strat.get("volume_ok", False)
+        and strat.get("spread_ok", False)
+        and rsi_in_range
+    )
 
 
 # =============================================================================
@@ -720,7 +743,7 @@ class BacktestSimulator:
                             hold_candles=i - position.entry_idx,
                         ))
                         # 쿨다운: 원래 사유 기반으로 판단
-                        is_stop = "손절" in original_sell_reason
+                        is_stop = classify_exit_reason(original_sell_reason) == "stop_loss"
                         cooldown_candles = (
                             cfg.cooldown_after_stop_loss_sec
                             if is_stop else cfg.cooldown_after_exit_sec
@@ -841,7 +864,7 @@ class BacktestSimulator:
                             net_pnl_pct=net_pct,
                             hold_candles=i - position.entry_idx,
                         ))
-                        is_stop = "손절" in sell_reason
+                        is_stop = classify_exit_reason(sell_reason) == "stop_loss"
                         cooldown_candles = (
                             cfg.cooldown_after_stop_loss_sec
                             if is_stop else cfg.cooldown_after_exit_sec
@@ -880,9 +903,15 @@ class BacktestSimulator:
 
             # ── 포지션 없음: 매수 판단 ────────────────────────────────────────
             # signal_next_candle=True 시 effective_score 는 전 봉 스코어
-            min_score = getattr(cfg, "min_entry_score", 0.0)  # 0이면 기존 score>0 동작 유지
+            min_score = getattr(cfg, "min_entry_score", 0.0)
             entry_threshold = min_score if min_score > 0 else 0.0
-            if effective_score >= entry_threshold and effective_score > 0:
+            # 라이브와 동일한 하드 필터 적용 (trend_up, pullback_ok, volume_ok, spread_ok, RSI)
+            entry_ok = (
+                effective_score >= entry_threshold
+                and effective_score > 0
+                and should_buy_backtest(cfg, strat, effective_score)
+            )
+            if entry_ok:
                 # ATR 기반 동적 포지션 사이징
                 atr_val = strat.get("atr", 0.0)
                 dynamic_buy_krw = calc_dynamic_buy_amount(cfg, current_price, atr_val)
